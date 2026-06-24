@@ -1,0 +1,1 @@
+from .extractor import extract_metadata_async, extract_metadata

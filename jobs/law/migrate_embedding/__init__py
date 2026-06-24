@@ -1,0 +1,43 @@
+import os
+import sys
+import structlog
+from pymongo import UpdateOne
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(PROJECT_ROOT)
+from constants import MongoDBConfig, MigrateConfig
+from core.v03.metadata_extractor.fields.extract_document_category import extract_document_category
+from core.common.elastic import search_document_content
+from jobs.law.utils import connect_to_databases
+from logs.logger_conf import setup_logging
+
+setup_logging()
+logger = structlog.get_logger()
+
+if __name__ == "__main__":
+    _, core_db = connect_to_databases()
+    
+    documents = list(core_db.law_documents.find({}))
+    logger.info(action="main", event="total_documents_count", count=len(documents))
+    
+    operations = []  # List to store bulk update operations
+    for doc in documents:
+        doc_id = doc.get('doc_id', None)
+        try:
+            content = search_document_content(doc_id=doc_id)
+            operations.append(
+                UpdateOne(
+                    {'doc_id': doc['doc_id']},
+                    {'$set': {'doc_content': content}}
+                )
+            )
+            # Process updates in batches of 1000 to balance memory and performance
+            if len(operations) >= 500:
+                core_db.law_documents.bulk_write(operations, ordered=False)
+                operations = []  # Clear the list after writing
+        except Exception as e:
+            logger.error(action="main", event="document_processing_failed", doc_id=doc_id, error=str(e), exc_info=True)
+
+    # Write any remaining operations
+    if operations:
+        core_db.law_documents.bulk_write(operations, ordered=False)
+

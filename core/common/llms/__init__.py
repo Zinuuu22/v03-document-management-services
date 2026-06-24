@@ -1,0 +1,388 @@
+import sys
+import os
+import re
+import json
+import ast
+import time
+import requests
+import re
+import httpx
+import asyncio
+import structlog
+
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.append(PROJECT_ROOT)
+
+from logs.logger_conf import setup_logging
+from constants import LLMsConfig
+
+setup_logging()
+logger = structlog.get_logger()
+
+
+class LLMs:
+    def __init__(self, llms_config=LLMsConfig):
+        self.llms_config = llms_config
+        
+    def _safe_int(self, value, default=50):
+        """Safely convert to int, return default on failure."""
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            logger.error("invalid_int_value", action="_safe_int", **{"error.code": "VAL", "error.message": f"Cannot convert {value} to int"}, default=default, exc_info=True)
+            return default
+    
+    def _safe_float(self, value, default=1.0):
+        """Safely convert to float, return default on failure."""
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            logger.error("invalid_float_value", action="_safe_float", **{"error.code": "VAL", "error.message": f"Cannot convert {value} to float"}, default=default, exc_info=True)
+            return default
+
+    def _build_payload(self, prompt, llms_config):
+        """Hàm dùng chung để build payload cho cả sync và async."""
+        if llms_config.USE_OLLAMA:
+            combined_prompt = f"{llms_config.PARAM_CONTENT}\n\nUser: {prompt}"
+            if llms_config.NO_THINK:
+                combined_prompt += "/no_think"
+            
+            return llms_config.LLMS_OLLAMA_BASE_URL, {
+                "model": llms_config.LLMS_MODEL_NAME,
+                "prompt": combined_prompt,
+                "stream": False,
+                "temperature": float(llms_config.PARAM_TEMPERATURE or 0.7),
+                "max_tokens": int(llms_config.PARAM_MAX_NEW_TOKENS or 1000),
+                "repeat_penalty": float(llms_config.PARAM_REPETITION_PENALTY or 1.0),
+            }
+        else:
+            return llms_config.LLMS_BASE_URL, {
+                "model": llms_config.LLMS_MODEL_NAME,
+                "messages": [
+                    {"role": "system", "content": llms_config.PARAM_CONTENT or "Bạn là một trợ lý AI hữu ích."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": float(llms_config.PARAM_TEMPERATURE or 0.7),
+                "max_tokens": int(llms_config.PARAM_MAX_NEW_TOKENS or 1000),
+                "stream": False,
+            }
+    
+    def llms(self, prompt, llms_config=None):
+        """
+        Phiên bản bất đồng bộ tối ưu. 
+        """
+        config = llms_config or self.llms_config
+        url, payload = self._build_payload(prompt, config)
+        
+        headers = {"Content-Type": "application/json"}
+        if not config.USE_OLLAMA:
+            headers["Authorization"] = f"Bearer {getattr(config, 'API_KEY', 'abc-123')}"
+
+        try:
+            response = requests.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            res_data = response.json()
+            
+            if config.USE_OLLAMA:
+                return res_data.get("response")
+            return res_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            logger.error("llm_sync_failed", action="llms", error=str(e), exc_info=True)
+            return None
+
+    
+    async def llms_async(self, prompt, client: httpx.AsyncClient, llms_config=None):
+        """
+        Phiên bản bất đồng bộ tối ưu. 
+        BẮT BUỘC truyền client để tận dụng Connection Pooling.
+        """
+        config = llms_config or self.llms_config
+        url, payload = self._build_payload(prompt, config)
+        
+        headers = {"Content-Type": "application/json"}
+        if not config.USE_OLLAMA:
+            headers["Authorization"] = f"Bearer {getattr(config, 'API_KEY', 'abc-123')}"
+
+        try:
+            response = await client.post(url, json=payload, headers=headers, timeout=120) # Dong 109
+            response.raise_for_status()
+            res_data = response.json()
+            
+            if config.USE_OLLAMA:
+                return res_data.get("response")
+            return res_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            logger.error("llm_async_failed", action="llms_async", error=str(e), exc_info=True)
+            return None
+
+    
+    def _sanitize_json_string(self, json_str: str) -> str:
+        """Escape newline thô nằm bên trong string value của JSON."""
+        result  = []
+        in_str  = False
+        escape  = False
+        i       = 0
+
+        while i < len(json_str):
+            ch = json_str[i]
+
+            if escape:
+                result.append(ch)
+                escape = False
+
+            elif ch == '\\' and in_str:
+                result.append(ch)
+                escape = True
+
+            elif ch == '"':
+                result.append(ch)
+                in_str = not in_str
+
+            elif in_str and ch == '\n':
+                result.append('\\n')   # ← escape newline thô
+
+            elif in_str and ch == '\r':
+                result.append('\\r')
+
+            elif in_str and ch == '\t':
+                result.append('\\t')
+
+            else:
+                result.append(ch)
+
+            i += 1
+
+        return "".join(result)
+
+
+    def _escape_inner_quotes(self, json_str: str) -> str:
+        result = []
+        in_string = False
+        escape_next = False
+
+        for i, ch in enumerate(json_str):
+            if escape_next:
+                result.append(ch)
+                escape_next = False
+                continue
+
+            if ch == '\\':
+                result.append(ch)
+                escape_next = True
+                continue
+
+            if ch == '"':
+                if not in_string:
+                    in_string = True
+                    result.append(ch)
+                else:
+                    # Tìm ký tự có nghĩa đầu tiên sau vị trí này
+                    next_meaningful = json_str[i+1:].lstrip(' \t\n\r')
+                    if not next_meaningful or next_meaningful[0] in (':', ',', '}', ']', '"'):
+                        in_string = False
+                        result.append(ch)
+                    else:
+                        result.append('\\"')
+                continue
+            result.append(ch)
+        return ''.join(result)
+        
+    def llms_post_process(self, input_string):
+        """
+        Hàm hậu xử lý JSON với hệ thống Log chi tiết (Tracer Mode).
+        Ghi lại chính xác cấp độ thành công để đo lường chất lượng Output của AI.
+        """
+        if not input_string:
+            logger.error("post_process_failed", action="llm_post_process", reason="empty_input", **{"error.code": "VAL"}, exc_info=True)
+            return None
+
+        # Log độ dài input ban đầu để ước lượng token
+        input_len = len(input_string)
+        logger.debug("post_process_start", action="llm_post_process", input_length=input_len)
+
+        # Bước 0: Cắt bỏ phần suy nghĩ (think)
+        if "</think>" in input_string:
+            clean_text = input_string.split("</think>")[-1].strip()
+            logger.debug("thinking_tags_removed", action="llm_post_process", remaining_length=len(clean_text))
+        else:
+            clean_text = input_string.strip()
+
+        # Tìm ranh giới JSON
+        first_brace = clean_text.find('{')
+        first_bracket = clean_text.find('[')
+        
+        if first_brace == -1 and first_bracket == -1:
+            logger.error("json_boundary_not_found", action="llm_post_process", 
+                           **{"error.code": "PARSE"}, 
+                           snippet=clean_text[:200])
+            return None
+
+        start_char = min(f for f in [first_brace, first_bracket] if f != -1)
+        end_char = clean_text.rfind('}') if clean_text[start_char] == '{' else clean_text.rfind(']')
+
+        if end_char == -1 or end_char <= start_char:
+            logger.error("json_invalid_structure", action="llm_post_process", 
+                           **{"error.code": "PARSE"}, 
+                           start_char=start_char, 
+                           end_char=end_char)
+            return None
+
+        json_str = clean_text[start_char:end_char + 1]
+
+        # --- CHIẾN THUẬT THỬ SAI VỚI LOG TỪNG CẤP ĐỘ ---
+        
+        # Cấp độ 1: JSON chuẩn
+        try:
+            result = json.loads(json_str)
+            logger.info("parse_json_success", action="llm_post_process", level_llm=1, method="standard")
+            return result
+        except (ValueError, SyntaxError) as e:
+            logger.debug("parse_json_level_failed", action="llm_post_process", level_llm=1, error=str(e))
+
+        # Cấp độ 2: ast.literal_eval trên chuỗi thô (xử lý single-quote Python-style từ LLM)
+        try:
+            python_format = json_str.replace("null", "None").replace("true", "True").replace("false", "False")
+            python_obj = ast.literal_eval(python_format)
+            result = json.loads(json.dumps(python_obj, ensure_ascii=False))
+            logger.info("parse_json_success", action="llm_post_process", level_llm=2, method="ast_eval_raw")
+            return result
+        except Exception as e:
+            logger.debug("parse_json_level_failed", action="llm_post_process", level_llm=2, error=str(e))
+
+        # Cấp độ 3: Xử lý newline thô
+        sanitized = self._sanitize_json_string(json_str)
+        try:
+            result = json.loads(sanitized)
+            logger.info("parse_json_success", action="llm_post_process", level_llm=3, method="sanitize_newline")
+            return result
+        except (ValueError, SyntaxError) as e:
+            logger.debug("parse_json_level_failed", action="llm_post_process", level_llm=3, error=str(e))
+
+        # Cấp độ 4: Xử lý inner quotes
+        escaped = self._escape_inner_quotes(sanitized)
+        try:
+            result = json.loads(escaped)
+            logger.info("parse_json_success", action="llm_post_process", level_llm=4, method="escape_quotes")
+            return result
+        except (ValueError, SyntaxError) as e:
+            logger.debug("parse_json_level_failed", action="llm_post_process", level_llm=4, error=str(e))
+
+        # Cấp độ 5: ast.literal_eval trên chuỗi đã xử lý (last resort)
+        try:
+            python_format = escaped.replace("null", "None").replace("true", "True").replace("false", "False")
+            python_obj = ast.literal_eval(python_format)
+            result = json.loads(json.dumps(python_obj, ensure_ascii=False))
+            logger.info("parse_json_success", action="llm_post_process", level_llm=5, method="ast_eval")
+            return result
+        except Exception as e:
+            # Nếu đến đây vẫn hỏng, log toàn bộ context để kỹ sư can thiệp
+            logger.error("parse_json_total_failure", action="llm_post_process",
+                           **{"error.code": "PARSE", "error.message": str(e)}, 
+                           final_str_attempted=escaped[:500], # Log 500 ký tự cuối cùng để soi lỗi
+                           exc_info=True)
+        
+        return None
+
+
+if __name__ == "__main__":
+    import sys
+    import os
+    import time
+    import json
+
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    sys.path.append(PROJECT_ROOT)
+    from constants import LLMsConfig
+
+    llms_config = LLMsConfig()
+    logger.debug("llm_config_loaded",
+                 base_url=llms_config.LLMS_BASE_URL,
+                 model_name=llms_config.LLMS_MODEL_NAME,
+                 temperature=llms_config.PARAM_TEMPERATURE,
+                 top_p=llms_config.PARAM_TOP_P,
+                 top_k=llms_config.PARAM_TOP_K,
+                 max_tokens=llms_config.PARAM_MAX_NEW_TOKENS,
+                 do_sample=llms_config.PARAM_DO_SAMPLE,
+                 repetition_penalty=llms_config.PARAM_REPETITION_PENALTY,
+                 ollama_url=llms_config.LLMS_OLLAMA_BASE_URL,
+                 use_ollama=llms_config.USE_OLLAMA,
+                 no_think=llms_config.NO_THINK)
+
+    logger.debug("llm_initializing")
+    llms = LLMs(llms_config=llms_config)
+
+    start_time = time.time()
+    prompt = """Đóng vai là một chuyên gia về luật, chuyên nhận diện sự mâu thuẫn về điều kiện/tiêu chuẩn. Hãy tư duy theo các bước sau:
+
+### **Bước 1: Trích xuất thông tin
+- Trích xuất [Chủ đề chính]:
++ [Chủ đề chính] là nội dung cốt lõi hoặc mục đích chính mà điều luật hướng đến, được xác định dựa trên ý nghĩa tổng quát của toàn bộ quy định.
++ Xác định [Chủ đề chính] của từng điều luật dựa trên nội dung tổng thể.
++ Nếu [Chủ đề chính] của hai điều luật khác nhau (ví dụ: một điều luật quy định điều kiện thuế, điều luật kia quy định tiêu chuẩn lao động), trả về kết quả dưới dạng JSON và dừng luồng tại đây: { 'result': False, 'reason': 'Chủ đề chính của hai điều luật khác nhau: <Chủ đề chính 1> (Điều luật 1) vs <Chủ đề chính 2> (Điều luật 2)' }
+- Trích xuất [Vấn đề]:
++ Xác định tất cả [Vấn đề] liên quan đến điều kiện/tiêu chuẩn trong từng điều luật (ví dụ: điều kiện để được miễn thuế, tiêu chuẩn để đăng ký kinh doanh).
+- Với mỗi [Vấn đề], trích xuất chi tiết:
++ [Đối tượng cần điều kiện tiêu chuẩn]: Đối tượng chịu tác động của điều kiện/tiêu chuẩn (ví dụ: doanh nghiệp, hồ sơ).
++ [Chủ thể cần điều kiện tiêu chuẩn]: Danh sách đầy đủ các chủ thể phải đáp ứng điều kiện/tiêu chuẩn (ví dụ: cá nhân, tổ chức).
++ [Chi tiết điều kiện, tiêu chuẩn yêu cầu]: Các điều kiện hoặc tiêu chuẩn cụ thể (ví dụ: doanh thu dưới 100 triệu, có giấy phép).
++ Lập danh sách [Vấn đề] của từng điều luật, kèm chi tiết [Đối tượng cần điều kiện tiêu chuẩn], [Chủ thể cần điều kiện tiêu chuẩn], [Chi tiết điều kiện, tiêu chuẩn yêu cầu].
+## Lưu ý: Phải trích xuất đầy đủ và chính xác, không bỏ sót bất kỳ yếu tố nào.
+
+### **Bước 2: Xác định [Vấn đề chung]
+- Trả lời câu hỏi: Trong danh sách [Vấn đề] của hai điều luật, có [Vấn đề] nào chung không?
+- [Vấn đề chung] được định nghĩa là vấn đề xuất hiện ở cả hai điều luật với cùng bản chất (ví dụ: cùng là điều kiện để miễn thuế, cùng là tiêu chuẩn để đăng ký).
+- Nếu có, lập danh sách [Vấn đề chung] và ghi rõ đó là vấn đề liên quan đến điều kiện/tiêu chuẩn.
+- Nếu không, trả kết quả dưới dạng JSON và dừng luồng tại đây: { 'result': False, 'reason': 'Không có vấn đề chung giữa hai điều luật'}.
+## Lưu ý: Chỉ coi là chung nếu cả hai điều luật đều đề cập rõ ràng đến vấn đề đó; không gộp các vấn đề riêng lẻ thành chung.
+
+### **Bước 3: Phân tích sơ bộ
+- Với từng [Vấn đề chung]:
++ Trích xuất [Chủ thể cần điều kiện tiêu chuẩn] và [Đối tượng cần điều kiện tiêu chuẩn]:
+++ Sử dụng danh sách [Chủ thể cần điều kiện tiêu chuẩn] và [Đối tượng cần điều kiện tiêu chuẩn] từ Bước 1.
++ So sánh [Chủ thể cần điều kiện tiêu chuẩn] và [Đối tượng cần điều kiện tiêu chuẩn]:
+++ Kiểm tra xem [Chủ thể cần điều kiện tiêu chuẩn] và [Đối tượng cần điều kiện tiêu chuẩn] có khác biệt không (nhằm xác định phạm vi phân tích mâu thuẫn).
+++ Xác định [Chủ thể chung] và [Đối tượng chung] (những yếu tố giống nhau giữa hai điều luật).
+- Nếu [Chủ thể cần điều kiện tiêu chuẩn] và [Đối tượng cần điều kiện tiêu chuẩn] có khác biệt thì dừng luồng tại đây: { 'result': False, 'reason': 'Không có chủ thể và đối tượng chung giữa hai điều luật'}.
+## Lưu ý: Chỉ phân tích trong phạm vi [Vấn đề chung], không xem xét các vấn đề riêng lẻ.
+
+### **Bước 4: Phân tích mâu thuẫn về điều kiện/tiêu chuẩn
+- Điều kiện: Chỉ thực hiện nếu [Vấn đề chung] bao gồm điều kiện/tiêu chuẩn (dựa trên Bước 2).
+- Với từng [Vấn đề chung], thực hiện các so sánh sau:
++ Với cùng [Đối tượng cần điều kiện tiêu chuẩn], [Chi tiết điều kiện, tiêu chuẩn yêu cầu A] có đối lập trực tiếp hoặc phủ định hoàn toàn [Chi tiết điều kiện, tiêu chuẩn yêu cầu B] không? (Ví dụ: yêu cầu doanh thu dưới 100 triệu vs cấm doanh thu dưới 100 triệu).
++ Với cùng [Chủ thể cần điều kiện tiêu chuẩn], [Chi tiết điều kiện, tiêu chuẩn yêu cầu A] có đối lập trực tiếp hoặc phủ định hoàn toàn [Chi tiết điều kiện, tiêu chuẩn yêu cầu B] không? (Ví dụ: cá nhân phải có giấy phép vs cá nhân không được có giấy phép).
+## Lưu ý quan trọng:
+- Không phân tích điều kiện/tiêu chuẩn ngoài phạm vi [Vấn đề chung] đã xác định ở Bước 2.
+- 'Đối lập trực tiếp hoặc phủ định hoàn toàn' là khi điều kiện/tiêu chuẩn của điều luật này loại trừ hoàn toàn điều kiện/tiêu chuẩn của điều luật kia (ví dụ: 'yêu cầu X' vs 'cấm X').
+
+### **Bước 5: Tổng hợp kết quả
+- 'result': True nếu có ít nhất một sự đối lập trực tiếp hoặc phủ định hoàn toàn trong [Chi tiết điều kiện, tiêu chuẩn yêu cầu] của bất kỳ [Vấn đề chung] nào liên quan đến [Đối tượng cần điều kiện tiêu chuẩn] hoặc [Chủ thể cần điều kiện tiêu chuẩn].
+- 'result': False nếu không có sự đối lập trực tiếp hoặc phủ định hoàn toàn.
+- Cung cấp lý giải ngắn gọn (2-3 câu) cho từng [Vấn đề chung], nêu rõ sự mâu thuẫn (nếu có).
+
+## Trả về kết quả dưới dạng JSON:
+{{
+  'result': <True/False>,
+  'detail': '<Lý giải ngắn gọn về sự mâu thuẫn (nếu có)>',
+  'main_object': ['<Danh sách tất cả chủ thể cần điều kiện tiêu chuẩn từ hai điều luật>'],
+  'object': ['<Danh sách tất cả đối tượng cần điều kiện tiêu chuẩn từ hai điều luật>'],
+  'standard': ['<Danh sách tất cả chi tiết điều kiện, tiêu chuẩn từ hai điều luật>']
+}}
+
+## Đầu vào:
+- Điều luật thứ 1: 'Điều 8. Tài sản dùng để bảo đảm thực hiện nghĩa vụ Tài sản dùng để bảo đảm thực hiện nghĩa vụ bao gồm: 1. Tài sản hiện có hoặc tài sản hình thành trong tương lai, trừ trường hợp Bộ luật Dân sự, luật khác liên quan cấm mua bán, cấm chuyển nhượng hoặc cấm chuyển giao khác về quyền sở hữu tại thời điểm xác lập hợp đồng bảo đảm, biện pháp bảo đảm; 2. Tài sản bán trong hợp đồng mua bán tài sản có bảo lưu quyền sở hữu; 3. Tài sản thuộc đối tượng của nghĩa vụ trong hợp đồng song vụ bị vi phạm đối với biện pháp cầm giữ; 4. Tài sản thuộc sở hữu toàn dân trong trường hợp pháp luật liên quan có quy định.'
+- Điều luật thứ 2: 'Điều 295. Tài sản bảo đảm 1. Tài sản bảo đảm phải thuộc quyền sở hữu của bên bảo đảm, trừ trường hợp cầm giữ tài sản, bảo lưu quyền sở hữu. 2. Tài sản bảo đảm có thể được mô tả chung, nhưng phải xác định được. 3. Tài sản bảo đảm có thể là tài sản hiện có hoặc tài sản hình thành trong tương lai. 4. Giá trị của tài sản bảo đảm có thể lớn hơn, bằng hoặc nhỏ hơn giá trị nghĩa vụ được bảo đảm.'
+## Lưu ý chung:
+- Đảm bảo trích xuất đầy đủ thông tin từ hai điều luật, không bỏ sót [Đối tượng cần điều kiện tiêu chuẩn], [Chủ thể cần điều kiện tiêu chuẩn], [Chi tiết điều kiện, tiêu chuẩn yêu cầu].
+- Giữ nhất quán giữa các bước: chỉ phân tích trong phạm vi [Vấn đề chung] đã xác định ở Bước 2.
+- Chỉ coi là 'mâu thuẫn' nếu có sự đối lập trực tiếp hoặc phủ định hoàn toàn (khác với 'không đồng nhất' là khác biệt không đối lập trực tiếp).
+- Đầu ra phải bằng tiếng Việt, dạng JSON, đầy đủ các trường thông tin, ngắn gọn và chính xác.
+"""
+    # response = llms.llms(prompt)
+    # logger.debug("llm_response_received", response_length=len(response) if response else 0)
+    # answer = llms.llms_post_process(response)
+    # logger.debug("llm_answer_processed", answer=answer)
+    # end_time = time.time()
+    # logger.debug("llm_execution_completed", elapsed_seconds=end_time - start_time)
+    
+    print(result)

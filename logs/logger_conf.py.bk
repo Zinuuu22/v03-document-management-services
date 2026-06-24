@@ -1,0 +1,96 @@
+import os
+import uuid
+import time
+import structlog
+from functools import wraps
+from structlog.contextvars import bind_contextvars, clear_contextvars
+
+_LEVEL_MAP = {
+    'debug': 10, 'info': 20, 'warning': 30, 'error': 40, 'critical': 50
+}
+
+logger = structlog.get_logger()
+# --- PHẦN 1: CẤU HÌNH LOGGING CHUẨN ECS ---
+def setup_logging():
+    min_level_name = os.getenv('LOG_LEVEL', 'DEBUG').lower()
+    min_level = _LEVEL_MAP.get(min_level_name, 0)
+
+    def _filter_by_level(logger, method_name, event_dict):
+        current_level = _LEVEL_MAP.get(method_name, 0)
+        if current_level < min_level:
+            raise structlog.DropEvent
+        return event_dict
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            _filter_by_level,
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.TimeStamper(fmt="iso", key="@timestamp"),
+            # SỬA Ở ĐÂY:
+            structlog.processors.JSONRenderer(
+                ensure_ascii=False, # Để hiển thị tiếng Việt trực tiếp
+                sort_keys=True      # Giúp log dễ đọc hơn khi debug
+            )
+        ],
+        logger_factory=structlog.PrintLoggerFactory(), # In ra stdout
+        cache_logger_on_first_use=True,
+    )
+    
+
+# --- PHẦN 2: CẤU HÌNH LOGGING CHUẨN KÀFKA ---
+class KafkaTraceTool:
+    @staticmethod
+    def get_headers():
+        """Helper cho Producer: Lấy trace.id hiện tại để gửi đi."""
+        ctx = structlog.contextvars.get_contextvars()
+        trace_id = ctx.get("trace.id", str(uuid.uuid4()))
+        
+        # Trả về format chuẩn của kafka-python
+        return [
+            ('trace.id', trace_id.encode('utf-8')),
+            ('event.start_time', str(time.time()).encode('utf-8'))
+        ]
+
+    @staticmethod
+    def trace_consumer(service_name):
+        """Decorator cho Consumer: Tự động trích xuất trace.id từ message."""
+        def decorator(func):
+            @wraps(func)
+            def wrapper(msg, *args, **kwargs):
+                # 1. Dọn dẹp túi cũ
+                clear_contextvars()
+                
+                # 2. Trích xuất Headers (Format của kafka-python là list of tuples)
+                raw_headers = dict(msg.headers) if msg.headers else {}
+                
+                trace_id = raw_headers.get('trace.id', b'new-trace-' + str(uuid.uuid4()).encode()[:8])
+                trace_id = trace_id.decode('utf-8')
+                
+                # 3. Dán nhãn xuyên suốt
+                bind_contextvars(
+                    **{
+                        "trace.id": trace_id,
+                        "service.name": service_name,
+                        "messaging.kafka.topic": msg.topic,
+                        "messaging.kafka.partition": msg.partition,
+                        "messaging.kafka.offset": msg.offset
+                    }
+                )
+                
+                start_time = time.perf_counter()
+                logger.info("kafka_message_received")
+                
+                try:
+                    result = func(msg, *args, **kwargs)
+                    
+                    duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                    logger.info("kafka_message_processed", duration_ms=duration_ms)
+                    return result
+                except Exception as e:
+                    logger.error("kafka_message_failed", **{"error.code": "KAF", "error.message": str(e)}, exc_info=True)
+                    raise e
+            return wrapper
+        return decorator

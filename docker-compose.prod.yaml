@@ -1,0 +1,152 @@
+version: "3.9"
+
+# --- PHẦN 1: ĐỊNH NGHĨA KHUÔN MẪU (TEMPLATE) ---
+x-logging-labels: &logging_labels
+  labels:
+    co.elastic.logs/enabled: "true"
+    co.elastic.logs/json.keys_under_root: "true"
+    co.elastic.logs/json.add_error_key: "true"
+    co.elastic.logs/json.message_key: "event"
+  logging:
+    options:
+      max-size: "10m"
+      max-file: "50"
+
+services:
+  # ===============================
+  # API Service
+  # ===============================
+  v03-document-management-apis-services-prod:
+    image: v03-document-management-services-prod:1.0
+    container_name: v03-document-management-apis-services-prod
+    <<: *logging_labels
+    command: gunicorn -w 4 -b 0.0.0.0:5001 --timeout 120 app:app
+    environment:
+      - ELASTIC_APM_SERVICE_NAME=v03-document-management-services-prod
+      - ELASTIC_APM_SERVER_URL=http://192.168.1.200:8200
+      - ELASTIC_APM_ENVIRONMENT=testing
+      - ELASTIC_APM_SECRET_TOKEN=AAEAAWVsYXN0aWMvZmxlZXQtc2VydmVyL3Rva2VuLTE3Njk1MDQ0MDA1NDQ6U2J3UUtYeTNUeGliRUxvazlMN3BZQQ
+      - ELASTIC_APM_VERIFY_SERVER_CERT=false
+      - SERVICE_NAME=v03-document-management-services-prod
+    ports:
+      - "5001:5001"
+    env_file:
+      - .env.prod
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+      - model_storage:/app/core/v03/tree_classifier/datasets
+      - tmp:/tmp
+      - /root/nltk_data:/root/nltk_data:ro
+    restart: unless-stopped
+    networks:
+      - app-tier
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ===============================
+  # Kafka Consumers
+  # ===============================
+  v03-document-extraction-worker-prod:
+    image: v03-document-management-services-prod:1.0
+    container_name: v03-document-extraction-worker-prod
+    <<: *logging_labels
+    command: python /app/services/kafka/manager/extract.py
+    environment:
+      - SERVICE_NAME=v03-document-extraction-worker
+    env_file:
+      - .env.prod
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+      - /root/nltk_data:/root/nltk_data:ro
+    restart: unless-stopped
+    networks: 
+      - app-tier
+    deploy:
+      resources:
+        limits:
+          cpus: "8.0"
+          memory: 32G
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  v03-document-tree-processor-worker-prod:
+    image: v03-document-management-services-prod:1.0
+    container_name: v03-document-tree-processor-worker-prod
+    <<: *logging_labels
+    command: python /app/services/kafka/manager/tree_process.py
+    environment:
+      - SERVICE_NAME=v03-document-tree-processor-worker-prod
+    env_file:
+      - .env.prod
+    volumes:
+      - tmp:/tmp
+      - /root/nltk_data:/root/nltk_data:ro
+    restart: unless-stopped
+    networks: 
+      - app-tier
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+
+  v03-document-indexing-worker-prod:
+    image: v03-document-management-services-prod:1.0
+    container_name: v03-document-indexing-worker-prod
+    <<: *logging_labels
+    command: python /app/services/kafka/manager/index.py
+    environment:
+      - SERVICE_NAME=v03-document-indexing-worker-prod
+    env_file:
+      - .env.prod
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+      - /root/nltk_data:/root/nltk_data:ro
+    restart: unless-stopped
+    networks: 
+      - app-tier
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ===============================
+  # Cron Job
+  # ===============================
+  v03-document-effective-status-cron-prod:
+    image: v03-document-management-services-prod:1.0
+    container_name: v03-document-effective-status-cron-prod
+    <<: *logging_labels
+    command: python /app/jobs/cron/update_effective_status/mirgrate.py
+    environment:
+      - SERVICE_NAME=v03-document-effective-status-cron-prod
+    env_file:
+      - .env.prod
+    volumes:
+      - tmp:/tmp
+      - /root/nltk_data:/root/nltk_data:ro
+    restart: unless-stopped
+    networks:
+      - app-tier
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+
+volumes:
+  huggingface_cache:
+  model_storage:
+  tmp:
+
+networks:
+  app-tier:
+    external: true
